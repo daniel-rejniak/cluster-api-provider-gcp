@@ -164,13 +164,23 @@ func (r *GCPMachineTemplateReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 	}()
 
+	// Get zone - prefer failure domains, fallback to region-a
+	// Machine type specs are identical across all zones in a region
+	var zone string
 	failureDomains := clusterScope.FailureDomains()
-	if len(failureDomains) == 0 {
-		logger.Info("GCPCluster has no discovered failure domains yet")
-		return ctrl.Result{RequeueAfter: machineTemplateCapacityRequeueAfter}, nil
+	if len(failureDomains) > 0 {
+		sort.Strings(failureDomains)
+		zone = failureDomains[0]
+	} else {
+		// Fallback: use first zone in region when failure domains not discovered yet
+		// This mirrors CAPA approach which uses region-level API without zone dependency
+		if gcpCluster.Spec.Region == "" {
+			logger.Info("GCPCluster has no region specified")
+			return ctrl.Result{RequeueAfter: machineTemplateCapacityRequeueAfter}, nil
+		}
+		zone = gcpCluster.Spec.Region + "-a"
+		logger.Info("Using default zone from region as fallback", "region", gcpCluster.Spec.Region, "zone", zone)
 	}
-	sort.Strings(failureDomains)
-	zone := failureDomains[0]
 
 	capacity, err := getMachineTypeCapacity(ctx, clusterScope.Compute, clusterScope.Project(), zone, instanceType)
 	if err != nil {
