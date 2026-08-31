@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -117,7 +118,7 @@ func (r *GCPMachineTemplateReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	instanceType := template.Spec.Template.Spec.InstanceType
-	if instanceType == "" || len(template.Status.Capacity) > 0 {
+	if instanceType == "" || (len(template.Status.Capacity) > 0 && template.Status.NodeInfo != nil) {
 		return ctrl.Result{}, nil
 	}
 
@@ -182,31 +183,42 @@ func (r *GCPMachineTemplateReconciler) Reconcile(ctx context.Context, req ctrl.R
 		logger.Info("Using default zone from region as fallback", "region", gcpCluster.Spec.Region, "zone", zone)
 	}
 
-	capacity, err := getMachineTypeCapacity(ctx, clusterScope.Compute, clusterScope.Project(), zone, instanceType)
+	machineType, err := getMachineType(ctx, clusterScope.Compute, clusterScope.Project(), zone, instanceType)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
+	capacity, err := machineTypeCapacity(machineType)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrapf(err, "invalid capacity for machine type %q", instanceType)
+	}
+
+	nodeInfo, err := machineTypeNodeInfo(ctx, clusterScope.Compute, clusterScope.Project(), machineType, template)
+	if err != nil {
+		logger.Info("Failed to determine nodeInfo from image, using defaults", "error", err)
+		// Use defaults: set only architecture from machine type, omit OS
+		nodeInfo = &infrav1.NodeInfo{
+			Architecture: getArchitectureFromMachineType(machineType),
+		}
+	}
+
 	original := template.DeepCopy()
 	template.Status.Capacity = capacity
+	template.Status.NodeInfo = nodeInfo
 	if err := r.Status().Patch(ctx, template, client.MergeFrom(original)); err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "failed to patch GCPMachineTemplate status")
 	}
 
-	logger.Info("Populated GCPMachineTemplate capacity", "instanceType", instanceType, "zone", zone, "capacity", template.Status.Capacity)
+	logger.Info("Populated GCPMachineTemplate capacity and nodeInfo", "instanceType", instanceType, "zone", zone, "capacity", template.Status.Capacity, "nodeInfo", nodeInfo)
 	return ctrl.Result{}, nil
 }
 
-func getMachineTypeCapacity(ctx context.Context, computeService *compute.Service, project, zone, instanceType string) (corev1.ResourceList, error) {
+func getMachineType(ctx context.Context, computeService *compute.Service, project, zone, instanceType string) (*compute.MachineType, error) {
 	machineType, err := computeService.MachineTypes.Get(project, zone, instanceType).Context(ctx).Do()
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to get machine type %q in zone %q", instanceType, zone)
 	}
-	capacity, err := machineTypeCapacity(machineType)
-	if err != nil {
-		return nil, errors.Wrapf(err, "invalid capacity for machine type %q", instanceType)
-	}
-	return capacity, nil
+	return machineType, nil
 }
 
 func machineTypeCapacity(machineType *compute.MachineType) (corev1.ResourceList, error) {
@@ -218,4 +230,138 @@ func machineTypeCapacity(machineType *compute.MachineType) (corev1.ResourceList,
 		corev1.ResourceCPU:    *resource.NewQuantity(machineType.GuestCpus, resource.DecimalSI),
 		corev1.ResourceMemory: resource.MustParse(fmt.Sprintf("%dMi", machineType.MemoryMb)),
 	}, nil
+}
+
+// machineTypeNodeInfo populates NodeInfo by querying GCP APIs.
+// Architecture: from MachineType API (already fetched for capacity).
+// OS: from Images API (queries boot disk image metadata).
+func machineTypeNodeInfo(ctx context.Context, computeService *compute.Service, project string, machineType *compute.MachineType, template *infrav1.GCPMachineTemplate) (*infrav1.NodeInfo, error) {
+	// Get architecture from machine type (no additional API call)
+	arch := getArchitectureFromMachineType(machineType)
+
+	// Get OS from image metadata (requires Images API call)
+	os, err := getOperatingSystemFromImage(ctx, computeService, project, template)
+	if err != nil {
+		return nil, err
+	}
+
+	return &infrav1.NodeInfo{
+		Architecture:    arch,
+		OperatingSystem: os,
+	}, nil
+}
+
+// getArchitectureFromMachineType extracts architecture from MachineType API response.
+func getArchitectureFromMachineType(machineType *compute.MachineType) infrav1.Architecture {
+	// GCP MachineType.Architecture values:
+	// - "ARM64" for ARM instances (t2a-*, c4a-*)
+	// - "X86_64" for x86 instances (all others)
+	// - empty/unset for older API responses (treat as x86_64)
+	if machineType.Architecture == "ARM64" {
+		return infrav1.ArchitectureArm64
+	}
+	return infrav1.ArchitectureAmd64
+}
+
+// getOperatingSystemFromImage determines OS by querying GCP Images API.
+// Mirrors AWS approach: query image metadata to detect Windows vs Linux.
+func getOperatingSystemFromImage(ctx context.Context, computeService *compute.Service, defaultProject string, template *infrav1.GCPMachineTemplate) (infrav1.OperatingSystem, error) {
+	// Strategy 1: Explicit image reference (takes precedence)
+	if template.Spec.Template.Spec.Image != nil {
+		return queryImageOS(ctx, computeService, defaultProject, *template.Spec.Template.Spec.Image, false)
+	}
+
+	// Strategy 2: Image family reference
+	if template.Spec.Template.Spec.ImageFamily != nil {
+		return queryImageOS(ctx, computeService, defaultProject, *template.Spec.Template.Spec.ImageFamily, true)
+	}
+
+	// Strategy 3: No image specified - default to Linux (safe assumption for CAPG)
+	// All current CAPG deployments use Linux, Windows support not yet implemented
+	return infrav1.OperatingSystemLinux, nil
+}
+
+// queryImageOS queries GCP Images API and checks guestOsFeatures for Windows.
+func queryImageOS(ctx context.Context, computeService *compute.Service, defaultProject, imageRef string, isFamily bool) (infrav1.OperatingSystem, error) {
+	// Parse image reference to extract project and image/family name
+	project, name, err := parseImageReference(imageRef, defaultProject)
+	if err != nil {
+		return "", err
+	}
+
+	// Query Images API
+	var image *compute.Image
+	if isFamily {
+		// Get latest image from family
+		image, err = computeService.Images.GetFromFamily(project, name).Context(ctx).Do()
+		if err != nil {
+			return "", errors.Wrapf(err, "failed to get image from family %q in project %q", name, project)
+		}
+	} else {
+		// Get specific image
+		image, err = computeService.Images.Get(project, name).Context(ctx).Do()
+		if err != nil {
+			return "", errors.Wrapf(err, "failed to get image %q in project %q", name, project)
+		}
+	}
+
+	// Check guestOsFeatures for WINDOWS marker
+	// GCP marks Windows images with "WINDOWS" feature in guestOsFeatures array
+	for _, feature := range image.GuestOsFeatures {
+		if feature.Type == "WINDOWS" {
+			return infrav1.OperatingSystemWindows, nil
+		}
+	}
+
+	// No WINDOWS feature = Linux
+	return infrav1.OperatingSystemLinux, nil
+}
+
+// parseImageReference parses GCP image reference into project and name.
+// Handles multiple formats:
+// - "projects/PROJECT/global/images/IMAGE"
+// - "projects/PROJECT/global/images/family/FAMILY"
+// - "global/images/IMAGE"
+// - "IMAGE" (short form, uses defaultProject)
+// - "family/FAMILY" (short form, uses defaultProject)
+func parseImageReference(ref, defaultProject string) (project, name string, err error) {
+	// Full path with project prefix
+	if strings.HasPrefix(ref, "projects/") {
+		parts := strings.Split(ref, "/")
+		// projects/PROJECT/global/images/IMAGE = 5 parts
+		// projects/PROJECT/global/images/family/FAMILY = 6 parts
+		if len(parts) < 5 {
+			return "", "", errors.Errorf("invalid image reference format: %s", ref)
+		}
+		project = parts[1]
+		if len(parts) >= 6 && parts[4] == "family" {
+			name = parts[5]
+		} else {
+			name = parts[4]
+		}
+		return project, name, nil
+	}
+
+	// Global path without project prefix
+	if strings.HasPrefix(ref, "global/images/") {
+		parts := strings.Split(ref, "/")
+		// global/images/IMAGE = 3 parts
+		// global/images/family/FAMILY = 4 parts
+		if len(parts) >= 4 && parts[2] == "family" {
+			name = parts[3]
+		} else if len(parts) >= 3 {
+			name = parts[2]
+		} else {
+			return "", "", errors.Errorf("invalid global image reference: %s", ref)
+		}
+		return defaultProject, name, nil
+	}
+
+	// Short form: "family/FAMILY" or "IMAGE"
+	if strings.HasPrefix(ref, "family/") {
+		name = strings.TrimPrefix(ref, "family/")
+	} else {
+		name = ref
+	}
+	return defaultProject, name, nil
 }
