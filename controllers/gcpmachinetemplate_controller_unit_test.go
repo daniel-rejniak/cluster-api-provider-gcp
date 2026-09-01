@@ -237,7 +237,7 @@ func TestMachineTypeNodeInfoWithImages(t *testing.T) {
 			g := gomega.NewWithT(t)
 
 			// Mock server for Images API
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				if tt.imageResponse != "" {
 					w.Header().Set("Content-Type", "application/json")
 					_, _ = w.Write([]byte(tt.imageResponse))

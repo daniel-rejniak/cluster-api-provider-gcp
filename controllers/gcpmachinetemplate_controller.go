@@ -47,6 +47,8 @@ import (
 const (
 	machineTemplateCapacityRequeueAfter = 30 * time.Second
 	gcpMachineTemplateKind              = "GCPMachineTemplate"
+	// GCP MachineType.Architecture values
+	gcpArchitectureARM64 = "ARM64"
 )
 
 // GCPMachineTemplateReconciler reconciles GCPMachineTemplate objects.
@@ -257,7 +259,7 @@ func getArchitectureFromMachineType(machineType *compute.MachineType) infrav1.Ar
 	// - "ARM64" for ARM instances (t2a-*, c4a-*)
 	// - "X86_64" for x86 instances (all others)
 	// - empty/unset for older API responses (treat as x86_64)
-	if machineType.Architecture == "ARM64" {
+	if machineType.Architecture == gcpArchitectureARM64 {
 		return infrav1.ArchitectureArm64
 	}
 	return infrav1.ArchitectureAmd64
@@ -347,11 +349,12 @@ func parseImageReference(ref, defaultProject string) (project, name string, err 
 		parts := strings.Split(ref, "/")
 		// global/images/IMAGE = 3 parts
 		// global/images/family/FAMILY = 4 parts
-		if len(parts) >= 4 && parts[2] == "family" {
+		switch {
+		case len(parts) >= 4 && parts[2] == "family":
 			name = parts[3]
-		} else if len(parts) >= 3 {
+		case len(parts) >= 3:
 			name = parts[2]
-		} else {
+		default:
 			return "", "", errors.Errorf("invalid global image reference: %s", ref)
 		}
 		return defaultProject, name, nil
