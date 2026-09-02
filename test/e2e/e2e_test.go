@@ -122,8 +122,8 @@ var _ = Describe("Workload cluster creation", func() {
 			Expect(template.Status.Capacity.Memory().IsZero()).To(BeFalse(), "Memory capacity should be set")
 
 			Expect(template.Status.NodeInfo).NotTo(BeNil(), "Status.NodeInfo should be populated")
-			Expect(template.Status.NodeInfo.Architecture).To(BeElementOf("amd64", "arm64"), "Architecture should be amd64 or arm64")
-			Expect(template.Status.NodeInfo.OperatingSystem).To(Equal("linux"), "OperatingSystem should be linux")
+			Expect(template.Status.NodeInfo.Architecture).To(BeElementOf(infrav1.ArchitectureAmd64, infrav1.ArchitectureArm64), "Architecture should be amd64 or arm64")
+			Expect(template.Status.NodeInfo.OperatingSystem).To(Equal(infrav1.OperatingSystemLinux), "OperatingSystem should be linux")
 
 			By("Scaling worker node to 3")
 			Expect(result.MachineDeployments).To(HaveLen(1))
