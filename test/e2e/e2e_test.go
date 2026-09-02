@@ -113,7 +113,7 @@ var _ = Describe("Workload cluster creation", func() {
 
 			template := &infrav1.GCPMachineTemplate{}
 			err := bootstrapClusterProxy.GetClient().Get(ctx,
-				client.ObjectKey{Namespace: templateRef.Namespace, Name: templateRef.Name},
+				client.ObjectKey{Namespace: md.Namespace, Name: templateRef.Name},
 				template)
 			Expect(err).NotTo(HaveOccurred())
 
